@@ -1,0 +1,5 @@
+#!/bin/sh
+if command -v python >/dev/null 2>&1; then
+    exec python deployment/manage.py check --staged
+fi
+exec python3 deployment/manage.py check --staged

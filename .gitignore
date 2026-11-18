@@ -1,0 +1,33 @@
+# Publish only reviewed source paths. Private files remain on disk.
+/*
+!/.gitignore
+!/.gitattributes
+!/AGENTS.md
+!/run.py
+!/requirements.txt
+!/*.bat
+!/.github/
+!/.github/**
+!/.githooks/
+!/.githooks/*
+!/study/
+!/study/**
+!/tests/
+!/tests/*.py
+!/deployment/
+/deployment/*
+!/deployment/*.py
+!/deployment/Project_Tools.ps1
+!/deployment/version-control.md
+!/deployment/server.example.json
+
+# Never publish live data, credentials, generated inventories or dependencies.
+**/__pycache__/
+**/*.py[cod]
+**/*.key
+**/*.pem
+**/*.token
+**/*.sqlite*
+**/.env*
+/deployment/file-inventory.csv
+/deployment/sync-baseline.json

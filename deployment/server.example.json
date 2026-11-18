@@ -1,0 +1,11 @@
+{
+  "host": "your-server.example.com",
+  "port": 22,
+  "user": "your-user",
+  "root": "/home/your-user/creative-study",
+  "service": "creative-study",
+  "site": "https://study.example.com",
+  "identity": ".runtime/deploy_ed25519",
+  "known_hosts": ".runtime/remote-known_hosts",
+  "github_repository": "your-account/CreativeLab"
+}

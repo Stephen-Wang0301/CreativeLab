@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#edf2ee">
+  <title>数字创意实验</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script defer src="/assets/common.js"></script>
+  <script defer src="/assets/participant.js"></script>
+</head>
+<body class="participant">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <span class="brand"><span class="brand-icon" aria-hidden="true"></span>数字创意实验</span>
+      <div class="bar-actions"><span id="participant-id" class="mono" hidden></span><button id="exit" class="text-button" hidden>退出实验</button></div>
+    </div>
+  </header>
+  <main class="participant-shell">
+    <div id="message" class="notice" role="status" hidden></div>
+    <div id="workspace" aria-live="polite"><section class="card"><p>正在连接实验服务器…</p></section></div>
+  </main>
+  <footer class="participant-foot"><span>人智协作与数字创意研究</span><span>请使用匿名编号联系研究人员</span></footer>
+</body>
+</html>

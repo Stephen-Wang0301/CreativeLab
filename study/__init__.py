@@ -1,0 +1,1 @@
+"""Local digital creativity study."""
