@@ -222,7 +222,7 @@ class Verify(unittest.TestCase):
             self.assertIn('suggestion', participant.act('start'))
             participant.act('submit', content=FINAL)
             self.assertEqual(participant.state['phase'], 'done')
-            folder = self.path / 'pilot' / pid
+            folder = self.path / 'batches' / 'pilot' / 'v0.1' / 'participants' / participant.state['participant_code']
             self.assertEqual(json.loads((folder / 'progress.json').read_text(encoding='utf-8'))['image_status'], 'not_configured')
             versions = [json.loads(line) for line in (folder / 'versions.jsonl').read_text(encoding='utf-8').splitlines()]
             before = next(x for x in versions if x['type'] == 'before_restore')

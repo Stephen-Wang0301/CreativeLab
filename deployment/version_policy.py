@@ -27,6 +27,7 @@ def allowed(name):
     if parent == 'tests':
         return len(path.parts) == 2 and suffix == '.py'
     if parent == 'deployment':
+        # Recognize the legacy menu so deployments can remove it and old Git history stays readable.
         return len(path.parts) == 2 and (suffix == '.py' or path.name in DEPLOY_DOCS
                                         or path.name == 'Project_Tools.ps1')
     if parent == '.github':

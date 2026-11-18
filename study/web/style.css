@@ -147,3 +147,9 @@ pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: .83rem/1.
   .side-caption, .side-footer { display: none; }
   .material-row { grid-template-columns: minmax(0, 1fr); }
 }
+/* The pause dialog lives directly under body, outside the blurred/inert task. */
+body.participant-paused .participant-shell,
+body.participant-paused .topbar,
+body.participant-paused .participant-foot { filter: blur(10px); pointer-events: none; user-select: none; }
+.pause-dialog { max-width: 620px; }
+.pause-dialog::backdrop { background: rgb(19 40 32 / 40%); backdrop-filter: blur(4px); }

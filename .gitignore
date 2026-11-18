@@ -17,7 +17,6 @@
 !/deployment/
 /deployment/*
 !/deployment/*.py
-!/deployment/Project_Tools.ps1
 !/deployment/version-control.md
 !/deployment/server.example.json
 

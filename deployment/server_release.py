@@ -1,6 +1,7 @@
 """Controlled Linux code deployment; live data and machine settings stay in place."""
 
 import argparse
+from contextlib import closing
 from datetime import datetime, timezone
 import json
 import os
@@ -169,10 +170,26 @@ def preflight(root, files):
                 compile(content, name, 'exec')
 
 
+def check_data_compatibility(root, files):
+    """Old engines cannot safely handle a frozen timer or a sealed restart."""
+    if ('study/participation.py' in files and b"'restarted'" in files.get('study/engine.py', b'')):
+        return
+    for name in ('data', 'data/quick-demo'):
+        path = root / name / '_system/study.sqlite3'
+        if not path.is_file():
+            continue
+        with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as db:
+            row = db.execute('''SELECT 1 FROM participants WHERE
+                json_type(data,'$.pause')='object' OR json_extract(data,'$.phase')='restarted' LIMIT 1''').fetchone()
+        if row:
+            raise RuntimeError('Target code cannot read paused/restarted attempts. Prepare a compatible code version; live records were not changed.')
+
+
 def apply(root, service_name, files, manifest, expected):
     old = source(root)
     if expected != fingerprints(old):
         raise RuntimeError('Server code changed before deployment; nothing was replaced.')
+    check_data_compatibility(root, files)
     preflight(root, files)
     ident = manifest['id']
     if not re.fullmatch(r'[0-9TZ]+-[a-f0-9]{10}', ident):
@@ -193,6 +210,7 @@ def apply(root, service_name, files, manifest, expected):
     previous_record = previous_current.read_bytes() if previous_current.exists() else None
     service(service_name, 'stop')
     try:
+        check_data_compatibility(root, files)
         replace_source(root, old, files)
         if fingerprints(source(root)) != fingerprints(files):
             raise RuntimeError('The written code failed its checksum verification.')

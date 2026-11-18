@@ -29,6 +29,11 @@
   let editingInput = false;
   let draftPending = false;
   let busy = false;
+  let loading = false;
+  let loadGeneration = 0;
+  const pageCache = new Map();
+  let invitations = [];
+  let invitationOffset = 0;
   let selectedPerson = null;
   let listPosition = 0;
   const filter = {text: "", group: "", phase: ""};
@@ -44,6 +49,7 @@
   const url = (name, withRevision = false) => root + mode + "/" + name +
     (withRevision && revision ? "?revision=" + encodeURIComponent(revision) : "");
   const capsule = (value, css = "") => el("span", {class: "pill " + css}, value);
+  const releaseCode = (value) => value.release_code || value.version_code;
 
   function select(options, value, handler) {
     const control = el("select", {}, options.map(([key, caption]) => el("option", {value: key}, caption)));
@@ -65,12 +71,16 @@
   async function transact(job, success, redraw = true) {
     if (busy) return;
     busy = true;
+    ++loadGeneration;
+    loading = false;
+    pageCache.clear();
+    workspace.setAttribute("aria-busy", "false");
     notice("");
     const active = document.activeElement;
     if (active instanceof HTMLButtonElement) active.disabled = true;
     try {
       const result = await job();
-      if (typeof success === "function") success(result);
+      if (typeof success === "function") await success(result);
       else if (success) notice(success);
       if (redraw) render();
     } catch (error) {
@@ -82,21 +92,56 @@
     }
   }
 
+  function useDashboard(payload) {
+    health = payload.health;
+    settings = payload.settings;
+    revision = String(payload.revision || "");
+    overview = payload.overview || null;
+    analysis = payload.analysis || null;
+    invitations = payload.invitations || [];
+    invitationOffset = 0;
+    if (settings.draft) resetConfig();
+    logout.hidden = false;
+  }
+
   async function load(change) {
-    await transact(async () => {
-      if (change) change();
-      health = await api(root + "health");
-      settings = await api(url("settings"));
-      if (revision && !settings.revisions.some((entry) => String(entry.id) === revision)) revision = "";
-      resetConfig();
-      if (page === "overview" || page === "people") overview = await api(url("overview", true));
-      if (page === "analysis") analysis = await api(url("analysis", true));
-      setConnection(true, "本机服务已连接");
-      logout.hidden = false;
-    });
+    if (busy || draftPending) return;
+    if (change) change();
+    const generation = ++loadGeneration;
+    const requestMode = mode, requestPage = page, requestRevision = revision;
+    const key = requestMode + ":" + requestRevision + ":" + requestPage;
+    const cached = pageCache.get(key);
+    const showCached = (page === "overview" || page === "people") && cached && Date.now() - cached.at < 30000;
+    loading = true;
+    if (showCached) useDashboard(cached.value);
+    else { health = settings = overview = analysis = null; }
+    render();
+    setConnection(true, showCached ? "正在刷新数据…" : "正在读取数据…");
+    try {
+      const path = root + requestMode + "/dashboard?page=" + requestPage +
+        (requestRevision ? "&revision=" + encodeURIComponent(requestRevision) : "");
+      const payload = await api(path);
+      if (generation !== loadGeneration) return;
+      useDashboard(payload);
+      const entry = {value: payload, at: Date.now()};
+      pageCache.set(key, entry);
+      pageCache.set(mode + ":" + revision + ":" + page, entry);
+      loading = false;
+      render();
+      setConnection(true, health.network.admin_url ? "服务器已连接" : "电脑预览服务已连接");
+    } catch (error) {
+      if (generation !== loadGeneration) return;
+      loading = false;
+      workspace.setAttribute("aria-busy", "false");
+      if (error.status === 401) login();
+      else { setConnection(false, "读取失败，可点击刷新重试"); notice(error.message, "error"); }
+    }
   }
 
   function login() {
+    ++loadGeneration;
+    loading = false;
+    pageCache.clear();
     settings = null;
     health = null;
     nav.replaceChildren();
@@ -124,6 +169,72 @@
     workspace.replaceChildren(el("section", {class: "card login-card"}, form));
   }
 
+  function personalLink(invitation) {
+    const net = health.network;
+    const base = net.public_url || (net.admin_url ? new URL(net.admin_url).origin : null) || net.lan_url || net.local_url;
+    return base.replace(/\/$/, "") + "/p/" + mode + "/#invite=" + encodeURIComponent(invitation.token);
+  }
+
+  function showInvitation(invitation, caption = "个人邀请已生成") {
+    const link = personalLink(invitation);
+    const input = el("input", {type: "text", readonly: true, value: link, class: "mono", "aria-label": "个人邀请链接"});
+    const close = () => { dialog.close(); dialog.remove(); };
+    const dialog = el("dialog", {"aria-label": caption}, el("div", {class: "stack"},
+      el("h2", {}, caption), p("版本 " + releaseCode(invitation), "mono"),
+      p("参与编号 " + invitation.participant_code, "mono"), input,
+      p("只发送给对应测试者。同一份链接用于同一次参与，重新打开会继续原记录；再次体验请生成另一份个人邀请。", "hint"),
+      row(button("复制个人邀请链接", async () => {
+        notice(await copyText(link) ? "已复制个人邀请链接。" : "请手动复制链接。");
+      }, "primary"), button("关闭", close))));
+    dialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
+    document.body.append(dialog);
+    dialog.showModal();
+  }
+
+  function createPersonalInvitation() {
+    return transact(() => api(url("invitations"), {revision: settings.active?.id}), (invitation) => {
+      invitations = [invitation, ...invitations.filter((item) => item.id !== invitation.id)];
+      invitationOffset = 0;
+      showInvitation(invitation);
+    });
+  }
+
+  function invitationPage(offset) {
+    return transact(() => api(url("invitations") + "?revision=" + settings.active.id + "&offset=" + offset), (answer) => {
+      invitations = answer.invitations;
+      invitationOffset = offset;
+    });
+  }
+
+  function recoverPerson(bundle) {
+    const plan = bundle.recovery;
+    if (!plan?.allowed) { notice(plan?.reason || "请刷新详情后再恢复。", "warn"); return; }
+    const info = bundle.progress;
+    const reason = el("textarea", {rows: 2, maxlength: 500, "aria-label": "恢复原因"});
+    reason.value = "测试中断，协助参与者继续已保存的进度。";
+    const close = () => { if (!busy) { dialog.close(); dialog.remove(); } };
+    const confirm = button("确认恢复", async () => {
+      await transact(() => api(url("person/" + info.id + "/recover"), {
+        expected_serial: plan.expected_serial, reason: reason.value,
+      }), (answer) => {
+        selectedPerson = answer.person;
+        overview = answer.overview;
+        dialog.close(); dialog.remove();
+        showInvitation(answer.invitation, "任务已恢复，发送此链接继续");
+        notice("已恢复到“" + plan.phase_name + "”。原始记录保留，并标记了人工恢复。");
+      });
+    }, "primary");
+    const dialog = el("dialog", {"aria-label": "恢复参与者任务"}, el("div", {class: "stack"},
+      el("h2", {}, "恢复参与者任务"), p(info.participant_code + " · 版本 " + plan.version_code, "mono"),
+      p("根据已保存记录，将回到“" + plan.phase_name + "”。"),
+      p(plan.seconds_on_start ? "再次开始该阶段时可用 " + plan.seconds_on_start + " 秒，已保存内容会载入。" : "已完成内容与原分组保留。", "hint"),
+      p("恢复前会保存完整状态快照，保留原有超时记录，并标记人工干预。已完成或主动退出的记录不会重新打开。", "hint"),
+      field("恢复原因", reason), row(confirm, button("取消", close))));
+    dialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
+    document.body.append(dialog);
+    dialog.showModal();
+  }
+
   function inviteCard() {
     const net = health.network;
     const publicMode = net.access === "pilot_tunnel" || net.access === "fixed";
@@ -142,17 +253,31 @@
       : publicMode ? net.tunnel_detail || "正在检查公网 HTTPS 入口。"
       : net.lan_url ? "链接适用于和实验电脑在同一局域网的设备。"
       : "当前启动方式仅供本机使用。跨网络预试请用 Start_Internet_Pilot.bat 启动。";
-    const folder = () => transact(() => api(root + "folder", {}), "已请求打开本地数据目录。", false);
+    const folder = () => transact(() => api(root + "folder", {}), "已请求在运行服务的电脑上打开数据目录。", false);
     return card(el("div", {class: "card-heading"}, title("邀请与数据目录"),
       capsule(label, publicMode && !verified ? "warn" : "")),
-      share ? p(share, "mono local-path key-line") : empty(reason),
-      row(share && button(publicMode ? "复制公网邀请链接" : "复制局域网邀请链接", async () => {
-        notice(await copyText(share) ? "已复制邀请链接。" : "请手动复制卡片中的链接。");
-      }, "primary"),
-      local && el("a", {class: "button secondary", href: local, target: "_blank", rel: "noopener"},
+      p("每次参与使用一份个人邀请；同一人要再次体验时，生成另一份即可。", "hint"),
+      row(button("生成新的个人邀请", createPersonalInvitation, "primary", {disabled: !settings.active}),
+      !publicMode && local && el("a", {class: "button secondary", href: local, target: "_blank", rel: "noopener"},
         "本机打开受试者页"),
-      button("打开数据目录", folder), button("刷新状态", () => load())),
+      button(publicMode ? "复制服务器数据路径" : "打开电脑数据目录", publicMode ? async () => {
+        notice(await copyText(health.data_path) ? "已复制服务器数据路径。" : health.data_path);
+      } : folder), button("刷新状态", () => load())),
+      invitations.length > 0 && el("details", {class: "panel"}, el("summary", {}, "待使用的个人邀请"),
+        p("首次报名建立记录后，会自动从此列表隐藏；继续链接可在参与者详情中查看。", "hint"),
+        table(["对应参与编号", "版本", "链接"], invitations.slice(0, 10).map((item) => [item.participant_code,
+          releaseCode(item), button("查看/复制", () => showInvitation(item), "secondary")])),
+        row(button("上一页", () => invitationPage(Math.max(0, invitationOffset - 10)), "secondary", {disabled: invitationOffset === 0}),
+          p("第 " + (invitationOffset / 10 + 1) + " 页 · 每页最多 10 条", "hint"),
+          button("下一页", () => invitationPage(invitationOffset + 10), "secondary", {disabled: invitations.length <= 10}))),
+      el("details", {class: "panel"}, el("summary", {}, "通用邀请（当前发布内容版本）"),
+        p("可发给首次参与、各自使用浏览器的多位测试者。同一浏览器会继续原记录；再次测试请生成个人邀请。", "hint"),
+        share ? p(share, "mono local-path key-line") : empty(reason),
+        share && button("复制通用邀请链接", async () => {
+          notice(await copyText(share) ? "已复制通用邀请链接。重复测试建议使用不同的个人邀请。" : "请手动复制链接。");
+        })),
       publicMode && !verified && p("如果持续连接失败，请查看 logs/cloudflared.log。", "hint"),
+      settings.active && p("新邀请属于当前发布版本 " + releaseCode(settings.active) + "；已有个人邀请继续绑定原内容版本。", "hint"),
       net.quick && p("当前为快速演练，数据存入 quick-demo。", "hint"),
       p(health.data_path, "mono local-path subtle"));
   }
@@ -168,10 +293,16 @@
       info.groups.map((g) => ["G" + g.group + " · " + g.label, g.assigned, g.text, g.image, g.early, g.late, g.timing_final]));
     const counts = (mapping, names) => Object.keys(mapping).length ?
       table(["状态", "人数"], Object.entries(mapping).map(([key, value]) => [names(key), value])) : empty("暂无记录。");
-    return el("div", {class: "stack"}, metrics, inviteCard(),
+    return el("div", {class: "stack"}, info.batch && card(
+      title("正在查看 " + info.batch.stage_name + " " + releaseCode(info.batch),
+        "按内容版本独立统计；功能补丁共用原批次和编号。已有参与者保留报名时的材料。"),
+      p("批次 " + info.batch.batch_id + " · 数据目录 " + info.batch.data_directory, "mono hint")),
+      info.archive_errors && Object.keys(info.archive_errors).length > 0 && card(
+        p("版本归档文件尚未同步完成，数据库记录仍保留。请检查磁盘空间和服务日志。", "notice warn inset")),
+      metrics, inviteCard(),
       info.unsynced.length > 0 && card(p("有 " + info.unsynced.length + " 个目录等待同步。服务器会自动重试。", "notice warn inset"),
         row(button("立即同步", () => transact(() => api(root + "sync", {}), (result) => {
-          notice(result.errors.length ? "仍有目录未同步，请检查本地目录权限和磁盘空间。" : "本地目录同步完成。");
+          notice(result.errors.length ? "仍有目录未同步，请检查服务的数据目录权限和磁盘空间。" : "数据目录同步完成。");
         }, false)))),
       card(title("分组与完成情况", "按所选方案版本统计。"), groups),
       el("div", {class: "equal-columns"}, card(title("阶段分布"), counts(info.phases, (x) => x)),
@@ -199,7 +330,7 @@
       const cancel = button("取消", () => finish(false), "secondary", {autofocus: true});
       const dialog = el("dialog", {"aria-labelledby": "draft-confirm-title", "aria-describedby": "draft-confirm-note"},
         el("div", {class: "stack"}, el("h2", {id: "draft-confirm-title"}, "保留这次修改？"),
-          p(caption), el("p", {id: "draft-confirm-note", class: "hint"}, "倒计时结束后将自动确认，并保存到本地草稿。"),
+          p(caption), el("p", {id: "draft-confirm-note", class: "hint"}, "倒计时结束后将自动确认，保存到当前服务的数据目录，尚不发布。"),
           row(confirm, cancel)));
       dialog.addEventListener("cancel", (event) => { event.preventDefault(); finish(false); });
       document.body.append(dialog);
@@ -229,7 +360,7 @@
         settings = answer;
         saved = true;
         if (redraw) { resetConfig(); render(); }
-        notice("已保存到本地草稿。");
+        notice(health.network.admin_url ? "已保存到服务器草稿，尚未发布。" : "已保存到电脑预览服务的草稿，尚未发布。");
       }, null, false);
       draftPending = false;
     }
@@ -331,30 +462,31 @@
     });
     const download = () => {
       const object = URL.createObjectURL(new Blob([JSON.stringify(config, null, 2)], {type: "application/json"}));
-      const link = el("a", {href: object, download: "study-protocol.json"});
+      const link = el("a", {href: object, download: mode + "-v" + settings.next_version + "-draft.json"});
       link.click();
       setTimeout(() => URL.revokeObjectURL(object), 1000);
     };
     const save = () => change({op: "revision", protocol: config, confirmed: confirmed.checked,
-      editor_version: settings.editor_version}, "已保存新方案版本。可开放招募。", true);
+      editor_version: settings.editor_version}, "已发布新方案版本，历史版本与数据继续保留。可开放招募。", true);
     const toggle = () => change({op: "recruiting", value: !settings.recruiting},
       settings.recruiting ? "已暂停新报名。" : "已开放新报名。");
     const rotate = () => {
-      if (window.confirm("更换邀请口令会让之前发出的报名链接失效。继续更换？")) {
+      if (window.confirm("更换通用口令会让之前发出的通用报名链接失效；个人邀请和恢复链接不受影响。继续更换？")) {
         change({op: "rotate_invite"}, "已更换邀请口令。");
       }
     };
     return el("div", {class: "stack"},
       card(el("div", {class: "card-heading"}, title("招募设置", settings.active ?
-        "当前版本 #" + settings.active.id + " · " + settings.active.protocol.label : "正式招募须先保存一版方案。"),
+        "当前发布版本 " + releaseCode(settings.active) : "正式招募须先发布版本 " + settings.next_version + "。"),
       capsule(settings.recruiting ? "招募开放" : "招募暂停", settings.recruiting ? "" : "warn")),
       p("新参与者使用当前版本。已报名参与者保留其报名时的方案和材料。", "hint"),
       p(settings.image_provider ? "本次运行的图像插件：" + settings.image_provider : "当前未接入图像插件，文字任务可完整运行。", "hint"),
       row(button(settings.recruiting ? "暂停新报名" : "开放新报名", toggle, "primary", {disabled: !settings.active}),
-        button("更换邀请口令", rotate))),
-      card(title("实验信息", "改完一项后，离开输入框即可确认保存到本地草稿。"),
+        button("更换通用邀请口令", rotate))),
+      card(title("实验信息", health.network.admin_url ? "改完一项后，离开输入框即可确认保存到服务器草稿；不会立即发布。" :
+        "改完一项后，离开输入框即可确认保存到电脑预览服务的草稿；不会立即发布。"),
         el("div", {class: "equal-columns"}, editable(config, "title", "实验名称", 100),
-          editable(config, "label", "方案版本说明", 70), editable(config, "cap", "本模式总招募上限", 5000, "number"),
+          editable(config, "cap", "本版本招募上限", 5000, "number"),
           editable(config, "contact", "联系方式", 500, "textarea")),
         editable(config, "consent", "知情同意说明", 4000, "textarea"),
         el("label", {class: "choice"}, adults, "报名时确认年满 18 周岁"),
@@ -362,9 +494,11 @@
           editable(config.durations_seconds, key, name + "（秒）", 3600, "number")))),
       materialSection("main_briefs", "主实验简报与工作稿", "每份简报有两项优先意图及两份对应的 AI 工作稿。"),
       materialSection("timing_briefs", "时机实验简报与建议", "每份简报有两条固定建议，各有独立的特征编码清单。"),
-      card(title("保存版本", settings.recruiting ? "草稿可随时保存。暂停新报名后，可将草稿保存为新版本。" : "保存为新版本后，新报名者将使用该版本。"),
+      card(title("发布版本 " + settings.next_version, settings.recruiting ?
+        "草稿可随时保存。暂停新报名后，可发布下一版本；旧数据保留在原版本。" :
+        "发布后，新报名者使用新版本。已有参与者继续原版本。草稿保存不会递增版本号。"),
         mode === "formal" && el("label", {class: "choice"}, confirmed, "我已核对正式材料、知情说明和联系方式。"),
-        row(button("保存为新版本", save, "primary", {disabled: settings.recruiting}), button("下载当前方案 JSON", download)),
+        row(button("发布为 " + settings.next_version, save, "primary", {disabled: settings.recruiting}), button("下载当前方案 JSON", download)),
         field("载入方案 JSON（可选）", upload)));
   }
 
@@ -390,11 +524,19 @@
     const timing = s.timing;
     const currentUrl = url("person/" + info.id);
     return el("section", {class: "card stack detail-section", id: "person-detail"},
-      el("div", {class: "card-heading"}, title(info.id, "方案 #" + info.revision + " · " + localTime(info.updated_at)),
+      el("div", {class: "card-heading"}, title(info.participant_code || info.id,
+        "方案 " + info.version_code + " · " + localTime(info.updated_at)),
         button("收起详情", () => { selectedPerson = null; render(); })),
       row(button("打开参与者文件夹", () => transact(() => api(root + "folder", {mode, id: info.id}),
         "已请求打开参与者文件夹。", false)),
+      button("恢复任务", () => recoverPerson(bundle), "primary", {disabled: !bundle.recovery?.allowed}),
+      button("查看/复制继续链接", () => transact(() => api(url("person/" + info.id + "/continue-link"), {}),
+        (invitation) => showInvitation(invitation, "本次记录的继续链接"), false)),
       anchor("下载此参与者 ZIP", url("raw.zip") + "?id=" + encodeURIComponent(info.id))),
+      info.paused && p("已暂停：继续链接不会重置计时、作答或分组。由受试者点击继续实验。", "notice inset"),
+      info.restart_to && p("从头开始已封存，下一份参与编号：" + info.restart_to, "mono hint"),
+      !bundle.recovery?.allowed && p(bundle.recovery?.reason || "", "hint"),
+      info.recovery_count > 0 && p("人工恢复 " + info.recovery_count + " 次；原始中断记录和恢复日志均保留。", "notice warn inset"),
       el("div", {class: "group-layout"},
         el("div", {class: "panel stack-sm"}, el("h3", {}, "主实验"),
           p("简报 " + main.brief + "　组别 " + (main.group ? "G" + main.group : "—"), "mono"),
@@ -422,25 +564,27 @@
 
   function peoplePage() {
     const people = overview?.participants || [];
-    const search = el("input", {type: "search", placeholder: "如 P-3A…", autocomplete: "off"});
+    const search = el("input", {type: "search", placeholder: "参与编号，如 S0-V0001-P000001，也可查原编号", autocomplete: "off"});
     search.value = filter.text;
     const list = el("div", {class: "stack"});
     const renderList = () => {
       const visible = people.filter((person) =>
-        person.id.toLowerCase().includes(filter.text.trim().toLowerCase()) &&
+        (person.id + " " + (person.participant_code || "") + " " + (person.invitation_label || "")).toLowerCase().includes(filter.text.trim().toLowerCase()) &&
         (!filter.group || String(person.group || "unassigned") === filter.group) &&
         (!filter.phase || person.phase === filter.phase));
       const pages = Math.max(1, Math.ceil(visible.length / 30));
       listPosition = Math.min(listPosition, pages - 1);
       const slice = visible.slice(listPosition * 30, (listPosition + 1) * 30);
-      const open = (pid) => transact(() => api(url("person/" + pid)), (bundle) => {
+      const open = (pid, recover = false) => transact(() => api(url("person/" + pid)), (bundle) => {
         selectedPerson = bundle;
+        if (recover) recoverPerson(bundle);
         setTimeout(() => document.getElementById("person-detail")?.scrollIntoView({block: "start"}), 0);
       });
-      list.replaceChildren(slice.length ? table(["匿名编号", "阶段", "主实验", "建议时机", "图像", "目录", "最近保存"], slice.map((person) => [
-        button(person.id, () => open(person.id), "secondary", {class: "button mono"}), person.phase_name,
+      list.replaceChildren(slice.length ? table(["匿名编号", "阶段", "主实验", "建议时机", "图像", "目录", "任务恢复", "最近保存"], slice.map((person) => [
+        button(person.participant_code || person.id, () => open(person.id), "secondary", {class: "button mono"}), person.phase_name,
         person.group ? "G" + person.group : "—", entryName(person.timing_entry), imgState(person.image_status),
-        person.synced ? capsule("已同步") : capsule("待同步", "warn"), localTime(person.updated),
+        person.synced ? capsule("已同步") : capsule("待同步", "warn"),
+        button("恢复", () => open(person.id, true), "secondary", {disabled: person.paused || ["done", "withdrawn", "restarted"].includes(person.phase)}), localTime(person.updated),
       ])) : empty("当前筛选条件下没有参与者。"),
       row(button("上一页", () => { listPosition--; renderList(); }, "secondary", {disabled: listPosition <= 0}),
         p("第 " + (listPosition + 1) + " / " + pages + " 页 · " + visible.length + " 条", "hint"),
@@ -500,7 +644,7 @@
   }
 
   function render() {
-    if (!settings || !health) return;
+    workspace.setAttribute("aria-busy", loading ? "true" : "false");
     nav.replaceChildren(...Object.entries(pages).map(([key, name]) => el("button", {
       type: "button", class: "nav-button" + (key === page ? " active" : ""), "aria-current": key === page ? "page" : undefined,
       onclick: () => {
@@ -514,14 +658,21 @@
         filter.text = filter.group = filter.phase = "";
       });
     });
-    const revisions = [["", settings.active ? "当前版本 #" + settings.active.id : "当前没有版本"],
-      ...settings.revisions.map((item) => [String(item.id), "#" + item.id + " · " + item.label])];
-    const version = select(revisions, revision, (value) => {
+    const revisions = settings?.revisions.length ? settings.revisions.map((item) =>
+      [String(item.id), releaseCode(item) + (item.id === settings.active?.id ? "（当前）" : "")]) : [["", "暂无已发布版本"]];
+    const version = select(revisions, revision, (value, control) => {
+      if (busy) { control.value = revision; return; }
       load(() => { revision = value; selectedPerson = null; listPosition = 0; });
     });
+    scope.setAttribute("aria-label", "实验阶段");
+    version.setAttribute("aria-label", "采集版本");
     toolbar.replaceChildren(el("div", {class: "stack-sm"}, el("span", {class: "kicker"}, "实验工作台"),
       el("h1", {}, pages[page])),
-      row(field("数据范围", scope), page !== "protocol" && field("方案版本", version)));
+      row(field("实验阶段", scope), page !== "protocol" && field("采集版本", version)));
+    if (!settings || !health) {
+      workspace.replaceChildren(card(p("正在读取" + pages[page] + "…", "hint")));
+      return;
+    }
     const content = {overview: overviewPage, protocol: protocolPage, people: peoplePage, analysis: analysisPage};
     workspace.replaceChildren(content[page]());
   }
@@ -554,7 +705,7 @@
     }
   }
   setInterval(() => {
-    if (page === "overview" && settings && !document.hidden && !busy) load();
+    if (page === "overview" && settings && !document.hidden && !busy && !loading) load();
   }, 10000);
   start();
 })();

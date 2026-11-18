@@ -39,11 +39,17 @@ def snapshot_data(source, destination):
         try:
             store.db.execute('UPDATE participants SET mirrored=-1')
             store.sync_pending()
-            if store.mirror_errors:
+            if store.mirror_errors or store.catalog_errors:
                 raise RuntimeError('Some participant files could not be regenerated from the snapshot.')
             counts[str(relative.parent.parent)] = {
                 'participants': store.db.execute('SELECT count(*) FROM participants').fetchone()[0],
                 'revisions': store.db.execute('SELECT count(*) FROM revisions').fetchone()[0],
+                'batches': [
+                    {**{k: store.revision(store.db, row['id'])[k] for k in
+                        ('mode', 'version_code', 'batch_id', 'data_directory')},
+                     'participants': row['n']}
+                    for row in store.db.execute('''SELECT r.id,count(p.id) AS n FROM revisions r
+                        LEFT JOIN participants p ON p.revision=r.id GROUP BY r.id ORDER BY r.mode,r.version_no''')],
             }
             store.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
         finally:
@@ -80,7 +86,8 @@ def create_backup(data, output, token_file):
         with tarfile.open(temporary, 'w:gz') as bundle:
             for name in ('run.py', 'requirements.txt', 'README.md', '.creative-study-004',
                          'study', 'runtime/packages', 'deployment'):
-                bundle.add(BASE / name, arcname=name, filter=portable)
+                if (BASE / name).exists():
+                    bundle.add(BASE / name, arcname=name, filter=portable)
             for name in ('data', 'private', 'backup-manifest.json'):
                 if (staging / name).exists():
                     bundle.add(staging / name, arcname=name, filter=portable)

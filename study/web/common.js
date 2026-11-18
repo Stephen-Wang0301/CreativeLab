@@ -23,11 +23,12 @@
   async function api(path, body, options = {}) {
     const abort = new AbortController();
     const timeout = window.setTimeout(() => abort.abort(), options.timeout || 16000);
-    const init = {credentials: "same-origin", cache: "no-store", signal: abort.signal};
+    const init = {credentials: "same-origin", cache: "no-store", signal: abort.signal,
+      headers: {...(options.headers || {})}};
     if (body !== undefined) {
       Object.assign(init, {
         method: "POST",
-        headers: {"Content-Type": "application/json", "X-Study-Request": "1"},
+        headers: {...init.headers, "Content-Type": "application/json", "X-Study-Request": "1"},
         body: JSON.stringify(body),
         keepalive: Boolean(options.keepalive),
       });

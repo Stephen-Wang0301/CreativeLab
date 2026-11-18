@@ -128,6 +128,22 @@ class VersionTests(unittest.TestCase):
         self.assertFalse((self.root / 'study/http.py').exists())
         self.assertEqual(data.read_bytes(), b'{}')
 
+    def test_incompatible_rollback_cannot_restart_frozen_timers_or_unseal_restarted_attempts(self):
+        path = self.root / 'data/_system/study.sqlite3'
+        path.parent.mkdir(parents=True)
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(path)) as db:
+            db.execute('CREATE TABLE participants(data TEXT)')
+            db.execute('INSERT INTO participants VALUES (?)', ('{"phase":"main_draft","pause":{"remaining":12}}',))
+            db.commit()
+        with patch.object(release, 'preflight') as preflight, patch.object(release, 'service') as service:
+            with self.assertRaisesRegex(RuntimeError, 'cannot read paused/restarted'):
+                release.apply(self.root, 'creative-study', self.old, {}, release.fingerprints(self.old))
+            preflight.assert_not_called()
+            service.assert_not_called()
+        release.check_data_compatibility(self.root, {'study/participation.py': b'', 'study/engine.py': b"TERMINAL={'restarted'}"})
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -9,6 +9,7 @@ import tempfile
 import zipfile
 
 from .config import GROUPS
+from .catalog import release_info
 from .engine import PHASE_NAMES, StudyError, find
 from .storage import digest, dumps, timestamp
 
@@ -83,7 +84,15 @@ class Research:
             revision = active
         else:
             try:
-                revision = int(revision)
+                if isinstance(revision, str) and re.fullmatch(r'[01]\.[1-9][0-9]*(?:\.[0-9]+)?', revision):
+                    number = int(revision.split('.')[1])
+                    expected_stage = '0' if mode == 'pilot' else '1'
+                    found = db.execute('SELECT id FROM revisions WHERE mode=? AND version_no=?', (mode, number)).fetchone()
+                    if revision.split('.')[0] != expected_stage or not found:
+                        raise ValueError('version belongs to another stage')
+                    revision = found['id']
+                else:
+                    revision = int(revision)
             except (TypeError, ValueError) as error:
                 raise StudyError('方案版本无效。') from error
             if not db.execute('SELECT 1 FROM revisions WHERE mode=? AND id=?', (mode, revision)).fetchone():
@@ -92,10 +101,16 @@ class Research:
                                (mode, revision))) if revision is not None else []
         return revision, rows
 
-    @staticmethod
-    def summary(row, state):
+    def summary(self, row, state):
+        version = self.store.revision(self.store.db, row['revision'])
         return {'id': row['id'], 'revision': row['revision'], 'phase': state['phase'],
-                'phase_name': PHASE_NAMES[state['phase']], 'group': state['main'].get('group'),
+                'mode': row['mode'], 'stage': version['stage'],
+                'participant_code': row['participant_code'], 'participant_no': row['participant_no'],
+                'version_code': version['version_code'], 'batch_id': version['batch_id'],
+                **release_info(version), 'paused': bool(state.get('pause')),
+                'recovery_count': state.get('recovery_count', 0),
+                'invitation_label': state.get('invitation_label'),
+                'phase_name': ('已暂停 · ' if state.get('pause') else '') + PHASE_NAMES[state['phase']], 'group': state['main'].get('group'),
                 'main_brief': state['main']['brief'], 'timing_brief': state['timing'].get('brief'),
                 'timing_suggestion': state['timing'].get('suggestion'), 'timing_entry': state['timing'].get('entry'),
                 'created': timestamp(row['created']), 'updated': timestamp(row['updated']),
@@ -118,7 +133,10 @@ class Research:
                  'timing_final': sum(p['group'] == key and p['timing_complete'] for p in participants)}
                 for key in GROUPS
             ]
-        return {'revision': revision, 'participants': participants, 'groups': groups,
+        batch = self.store.revision(self.store.db, revision) if revision is not None else None
+        return {'revision': revision, 'batch': {k: batch[k] for k in
+                ('version_code', 'batch_id', 'stage', 'stage_name', 'data_directory')} | release_info(batch) if batch else None,
+                'participants': participants, 'groups': groups, 'archive_errors': dict(self.store.catalog_errors),
                 'enrolled': len(participants), 'assigned': sum(g['assigned'] for g in groups),
                 'completed': sum(p['phase'] == 'done' and p['timing_complete'] and p['main_complete'] for p in participants),
                 'withdrawn': sum(p['phase'] == 'withdrawn' for p in participants),
@@ -134,11 +152,14 @@ class Research:
 
     def detail(self, mode, pid):
         with self.store.lock:
-            return self.store.export(self.store.db, self.participant(mode, pid))
+            row = self.participant(mode, pid)
+            result = self.store.export(self.store.db, row)
+            result['recovery'] = self.study.recovery.preview(row, result['responses'])
+            return result
 
     def item(self, row, protocol, task):
         state = json.loads(row['data'])
-        if state['phase'] == 'withdrawn':
+        if state['phase'] in {'withdrawn', 'restarted'}:
             return None
         main, timing = state['main'], state['timing']
         main_brief = find(protocol['main_briefs'], main['brief'])
@@ -287,7 +308,16 @@ class Research:
         for row in rows:
             state = json.loads(row['data'])
             main, timing = state['main'], state['timing']
-            record = dict(id=row['id'], revision=revision, group=main.get('group'), fit=main.get('fit'),
+            record = dict(id=row['id'], revision=revision, participant_code=row['participant_code'],
+                          recovery_count=state.get('recovery_count', 0), admin_recovered=bool(state.get('recovery_count')),
+                          enrolled_release=state.get('enrolled_release', self.store.revision(self.store.db, revision)['version_code'] + '.0'),
+                          last_release=state.get('last_release', self.store.revision(self.store.db, revision)['version_code'] + '.0'),
+                          pause_count=state.get('pause_count', 0), pause_seconds=state.get('pause_seconds', 0),
+                          paused=bool(state.get('pause')), restarted=state['phase'] == 'restarted',
+                          restart_to=state.get('restart_to'), restart_from=state.get('restart_from'),
+                          version_code=self.store.revision(self.store.db, revision)['version_code'],
+                          batch_id=self.store.revision(self.store.db, revision)['batch_id'],
+                          stage=0 if mode == 'pilot' else 1, group=main.get('group'), fit=main.get('fit'),
                           friction=main.get('friction'), main_brief=main['brief'], main_intent=main.get('intent'),
                           ai_draft=main.get('ai_id'), experience=main.get('experience'), entry=timing.get('entry'),
                           timing_brief=timing.get('brief'), timing_suggestion=timing.get('suggestion'),
@@ -375,23 +405,26 @@ class Research:
                 summary = []
                 ratings = []
                 for row, bundle in bundles:
+                    folder = row['participant_code']
                     summary.append(self.summary(row, bundle['responses']))
                     for name, value in bundle.items():
                         if name in ('events', 'versions'):
                             data = ''.join(dumps(item) + '\n' for item in value)
-                            archive.writestr(f'{row["id"]}/{name}.jsonl', data)
+                            archive.writestr(f'{folder}/{name}.jsonl', data)
                         else:
-                            archive.writestr(f'{row["id"]}/{name}.json', dumps(value, pretty=True))
+                            archive.writestr(f'{folder}/{name}.json', dumps(value, pretty=True))
                     for rating in bundle['ratings']:
-                        ratings.append(dict(id=row['id'], **rating))
+                        ratings.append(dict(id=row['id'], participant_code=row['participant_code'],
+                                            version_code=protocol['version_code'], **rating))
                     for record in bundle['responses']['image']['rounds']:
                         for filename in record['files']:
                             file = self.store.participant_path(row) / 'images' / filename
                             if file.is_file():
-                                archive.write(file, f'{row["id"]}/images/{filename}',
+                                archive.write(file, f'{folder}/images/{filename}',
                                               compress_type=zipfile.ZIP_STORED)
                 archive.writestr('participants.csv', csv_bytes(list(summary[0]), summary))
-                archive.writestr('ratings_long.csv', csv_bytes(['id', 'task', 'rater', 'at', 'score', 'notes'], ratings))
+                archive.writestr('ratings_long.csv', csv_bytes(['id', 'participant_code', 'version_code',
+                    'task', 'rater', 'at', 'score', 'notes'], ratings))
         except BaseException:
             stream.close()
             raise

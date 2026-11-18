@@ -8,6 +8,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from .config import GROUPS, create_initial, validate
+from .catalog import version_info, release_info
+from .access import Invitations
+from .errors import StudyError
+from .recovery import Recovery
+from .participation import Participation
 from .images import ImageRequest, validate_candidates
 from .storage import atomic_write, digest, dumps, timestamp
 
@@ -18,21 +23,15 @@ PHASE_NAMES = {
     'main_post': '任务一 · 回顾意图', 'timing_intro': '任务二 · 阅读简报',
     'timing_suggestion': '任务二 · 阅读建议', 'timing_ideas': '任务二 · 构思两案',
     'timing_final': '任务二 · 完成提案', 'done': '已完成',
-    'withdrawn': '已退出', 'incomplete': '未完成',
+    'withdrawn': '已退出', 'incomplete': '未完成', 'restarted': '已存档 · 从头开始',
 }
 TIMED = {'main_draft', 'main_edit', 'timing_suggestion', 'timing_ideas', 'timing_final'}
 DRAFT_PHASES = {'main_draft', 'main_edit', 'timing_ideas', 'timing_final'}
-TERMINAL = {'done', 'withdrawn', 'incomplete'}
+TERMINAL = {'done', 'withdrawn', 'incomplete', 'restarted'}
 MODES = {'pilot': '预试', 'formal': '正式'}
 TOKEN_FORMAT = re.compile(r'^[A-Za-z0-9_-]{16,96}$')
 PID_FORMAT = re.compile(r'^P-[A-F0-9]{16}$')
-
-
-class StudyError(Exception):
-    def __init__(self, message, status=400, code='invalid'):
-        super().__init__(message)
-        self.status = status
-        self.code = code
+PARTICIPANT_CODE_FORMAT = re.compile(r'^(?:Q-)?S[01]-V[0-9]{4,}-P[0-9]{6,}$')
 
 
 def read_text(body, key, maximum):
@@ -74,6 +73,9 @@ class Study:
         self.clock = clock
         self.image_name = image_name
         self.provider = provider
+        self.access = Invitations(self)
+        self.recovery = Recovery(self)
+        self.participation = Participation(self)
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='study-image') if provider else None
         with self.store.transaction() as db:
             for mode in MODES:
@@ -89,10 +91,12 @@ class Study:
                 db.execute('INSERT INTO modes VALUES (?,?,?,?)',
                            (mode, revision, int(mode == 'pilot'), secrets.token_urlsafe(14)))
         self.recover_image_jobs()
+        self.store.sync_catalog()
 
     def add_revision(self, db, mode, config, now):
-        return db.execute('INSERT INTO revisions(mode,created,protocol,image_provider) VALUES (?,?,?,?)',
-                          (mode, now, dumps(config), self.image_name)).lastrowid
+        number = db.execute('SELECT coalesce(max(version_no),0)+1 FROM revisions WHERE mode=?', (mode,)).fetchone()[0]
+        return db.execute('INSERT INTO revisions(mode,created,protocol,image_provider,version_no) VALUES (?,?,?,?,?)',
+                          (mode, now, dumps(config), self.image_name, number)).lastrowid
 
     def mode_status(self, db, mode):
         if mode not in MODES:
@@ -105,15 +109,19 @@ class Study:
             record = self.mode_status(db, mode)
             saved_draft = db.execute('SELECT token, protocol FROM protocol_drafts WHERE mode=?', (mode,)).fetchone()
             revisions = [
-                {'id': item['id'], 'at': timestamp(item['created']),
+                {'id': item['id'], 'at': timestamp(item['created']), **version_info(mode, item['version_no']),
                  'label': json.loads(item['protocol'])['label'], 'image_provider': item['image_provider']}
                 for item in db.execute('SELECT * FROM revisions WHERE mode=? ORDER BY id DESC', (mode,))
             ]
+            active = self.store.revision(db, record['revision']) if record['revision'] else None
+            for item in revisions + ([active] if active else []):
+                item.update(release_info(item))
             return {'mode': mode, 'recruiting': bool(record['recruiting']), 'invite': record['invite'],
-                    'active': self.store.revision(db, record['revision']) if record['revision'] else None,
+                    'active': active,
                     'saved_draft': json.loads(saved_draft['protocol']) if saved_draft else None,
                     'editor_version': saved_draft['token'] if saved_draft else str(record['revision'] or 0),
-                    'draft': create_initial(), 'revisions': revisions, 'image_provider': self.image_name}
+                    'draft': create_initial(), 'revisions': revisions, 'image_provider': self.image_name,
+                    'next_version': release_info(version_info(mode, max((r['version_no'] for r in revisions), default=0)+1))['release_code']}
 
     def change_settings(self, mode, body):
         op = body.get('op')
@@ -158,7 +166,8 @@ class Study:
                 db.execute('UPDATE modes SET invite=? WHERE id=?', (secrets.token_urlsafe(14), mode))
             else:
                 raise StudyError('无法识别此操作。')
-            return self.settings(mode)
+        self.store.sync_catalog()
+        return self.settings(mode)
 
     @staticmethod
     def draw(db, scope, choices):
@@ -173,16 +182,20 @@ class Study:
                    (key, dumps(remaining)))
         return result
 
-    def landing(self, mode):
+    def landing(self, mode, invite=None):
         with self.store.lock:
             db = self.store.db
             record = self.mode_status(db, mode)
+            personal = self.access.resolve(db, mode, invite)
             if not record['revision']:
                 return {'mode': mode, 'open': False, 'title': '人智协作与数字创意实验'}
-            protocol = self.store.revision(db, record['revision'])['protocol']
-            return {'mode': mode, 'open': bool(record['recruiting']), 'title': protocol['title'],
+            version = self.store.revision(db, personal['revision'] if personal else record['revision'])
+            protocol = version['protocol']
+            return {'mode': mode, 'open': bool(record['recruiting']) and (not personal or personal['revision'] == record['revision']), 'title': protocol['title'],
                     'consent': protocol['consent'], 'contact': protocol['contact'],
-                    'adult_only': protocol['adult_only']}
+                    'adult_only': protocol['adult_only'], 'version_code': version['version_code'], **release_info(version),
+                    'invitation_label': personal['label'] if personal else None,
+                    'reserved_code': personal['participant_code'] if personal else None}
 
     def join(self, mode, body):
         invite, nonce = body.get('invite'), body.get('nonce')
@@ -196,8 +209,12 @@ class Study:
         now = self.clock()
         with self.store.transaction() as db:
             record = self.mode_status(db, mode)
-            if not isinstance(invite, str) or not TOKEN_FORMAT.fullmatch(invite) or not hmac.compare_digest(invite, record['invite']):
+            personal = self.access.resolve(db, mode, invite)
+            if not personal and (not isinstance(invite, str) or not TOKEN_FORMAT.fullmatch(invite) or not hmac.compare_digest(invite, record['invite'])):
                 raise StudyError('邀请口令有误，请使用研究人员发给你的链接。', 403)
+            if personal:
+                nonce_hash = digest(mode + '|personal|' + personal['id'])
+                recovery = hmac.new(self.store.secret.encode(), ('resume|' + nonce_hash).encode(), 'sha256').hexdigest()[:24]
             existing = db.execute('SELECT id FROM participants WHERE nonce=?', (nonce_hash,)).fetchone()
             if existing:
                 pid = existing['id']
@@ -205,41 +222,59 @@ class Study:
             else:
                 if not record['recruiting'] or not record['revision']:
                     raise StudyError('当前未开放新报名。', 409)
+                if personal and personal['revision'] != record['revision']:
+                    raise StudyError('这份邀请属于已停止新报名的旧版本，请联系研究人员领取新邀请。', 409)
                 revision = record['revision']
                 protocol = self.store.revision(db, revision)['protocol']
                 if protocol['adult_only'] and body.get('adult') is not True:
                     raise StudyError('请确认已满足年龄条件。')
-                count = db.execute('SELECT COUNT(*) FROM participants WHERE mode=?', (mode,)).fetchone()[0]
+                count = db.execute('SELECT COUNT(*) FROM participants WHERE mode=? AND revision=?', (mode, revision)).fetchone()[0]
                 if count >= protocol['cap']:
                     raise StudyError('当前招募名额已满。', 409)
                 brief = self.draw(db, [revision, 'main_brief'], [x['id'] for x in protocol['main_briefs']])
                 pid = 'P-' + secrets.token_hex(8).upper()
+                participant_no, participant_code = ((personal['participant_no'], personal['participant_code'])
+                    if personal else self.store.allocate_participant(db, revision))
                 state = {'phase': 'main_brief', 'seq': 1, 'entered': now, 'started': None,
                          'deadline': None, 'edit_version': 0, 'work': {},
                          'main': {'brief': brief}, 'timing': {}, 'missing': [],
                          'consented': timestamp(now),
                          'adult_declared': True if protocol['adult_only'] else None,
                          'image': {'status': 'pending', 'rounds': [], 'job': None}}
+                state['enrolled_release'] = state['last_release'] = release_info(self.store.revision(db, revision))['release_code']
+                if personal:
+                    state['invitation_label'] = personal['label']
+                    parent = db.execute('SELECT participant FROM restart_links WHERE invitation=?', (personal['id'],)).fetchone()
+                    if parent:
+                        state['restart_from'] = parent['participant']
                 db.execute('''INSERT INTO participants
-                              (id,mode,revision,created,updated,token,resume,nonce,blind,data)
-                              VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                              (id,mode,revision,created,updated,token,resume,nonce,blind,data,participant_no,participant_code)
+                              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
                            (pid, mode, revision, now, now, digest(token), digest(recovery),
-                            nonce_hash, secrets.token_hex(16), dumps(state)))
+                            nonce_hash, secrets.token_hex(16), dumps(state), participant_no, participant_code))
                 self.store.event(db, pid, now, 'main_brief', 'consented', revision=revision, brief=brief)
+                if personal:
+                    db.execute('UPDATE invitations SET participant=? WHERE id=? AND participant IS NULL', (pid, personal['id']))
         self.store.sync(pid)
         return pid, recovery, token
 
-    def resume(self, mode, body):
+    def resume(self, mode, body, invite=None):
         pid = body.get('id')
         code = body.get('code')
-        if not isinstance(pid, str) or not isinstance(code, str) or not PID_FORMAT.fullmatch(pid.upper().strip()) or not re.fullmatch(r'[a-fA-F0-9]{24}', code.strip()):
+        if (not isinstance(pid, str) or not isinstance(code, str)
+                or not (PID_FORMAT.fullmatch(pid.upper().strip()) or PARTICIPANT_CODE_FORMAT.fullmatch(pid.upper().strip()))
+                or not re.fullmatch(r'[a-fA-F0-9]{24}', code.strip())):
             raise StudyError('请填写正确的参与者编号和恢复码。', 403)
         pid, code = pid.upper().strip(), code.lower().strip()
         token = secrets.token_urlsafe(32)
         with self.store.transaction() as db:
-            row = db.execute('SELECT * FROM participants WHERE id=? AND mode=?', (pid, mode)).fetchone()
+            row = db.execute('SELECT * FROM participants WHERE (id=? OR participant_code=?) AND mode=?', (pid, pid, mode)).fetchone()
             if not row or not hmac.compare_digest(row['resume'], digest(code)):
                 raise StudyError('参与者编号或恢复码有误。', 403)
+            personal = self.access.resolve(db, mode, invite)
+            if personal and personal['participant'] != row['id']:
+                raise StudyError('这份个人邀请与所填编号不一致，请使用对应的邀请链接。', 403)
+            pid = row['id']
             db.execute('UPDATE participants SET token=?,serial=serial+1 WHERE id=?', (digest(token), pid))
             self.store.event(db, pid, self.clock(), json.loads(row['data'])['phase'], 'session_resumed')
         self.store.sync(pid)
@@ -271,12 +306,23 @@ class Study:
 
     def public_state(self, row, state, protocol):
         phase = state['phase']
+        version = self.store.revision(self.store.db, row['revision'])
         result = {'id': row['id'], 'phase': phase, 'seq': state['seq'], 'title': protocol['title'],
+                  'participant_code': row['participant_code'], 'version_code': version['version_code'],
+                  **release_info(version),
                   'phase_name': PHASE_NAMES[phase], 'contact': protocol['contact'],
                   'started': state['started'], 'deadline': state['deadline'],
                   'now': self.clock(), 'edit_version': state['edit_version'],
-                  'duration': protocol['durations_seconds'].get(phase),
+                  'duration': state.get('recovery_timer_seconds', protocol['durations_seconds'].get(phase)),
                   'mode': row['mode']}
+        invitation = self.store.db.execute('SELECT id FROM invitations WHERE participant=?', (row['id'],)).fetchone()
+        result['access_scope'] = invitation['id'] if invitation else None
+        result['recovery_count'] = state.get('recovery_count', 0)
+        result['pause'] = state.get('pause')
+        result['page_draft'] = state.get('page_draft', {})
+        result['restart_allowed'] = row['mode'] == 'pilot'
+        challenge = state.get('restart_challenge')
+        result['restart_challenge'] = challenge
         if phase in TERMINAL:
             return result
         main, timing = state['main'], state['timing']
@@ -308,6 +354,10 @@ class Study:
 
     def transition(self, db, pid, state, phase, now):
         previous = state['phase']
+        state.pop('recovery_work', None)
+        state.pop('recovery_seconds', None)
+        state.pop('recovery_timer_seconds', None)
+        state.pop('page_draft', None)
         state.update(phase=phase, seq=state['seq']+1, entered=now, started=None, deadline=None,
                      edit_version=0, work={}, work_version=None)
         self.store.event(db, pid, now, phase, 'phase_entered', previous=previous)
@@ -333,6 +383,10 @@ class Study:
                 if state['deadline'] is not None and now >= state['deadline']:
                     raise StudyError('本阶段计时已结束。', 409, 'stale_phase')
                 job = self.handle(db, row, state, revision, body, now)
+                release = release_info(revision)['release_code']
+                if state.get('last_release') != release:
+                    self.store.event(db, pid, now, state['phase'], 'feature_release_used', release=release)
+                state['last_release'] = release
                 if body.get('op') != 'save':
                     db.execute('INSERT INTO commands VALUES (?,?)', (pid, key))
                 self.store.save(db, pid, now, state)
@@ -340,7 +394,18 @@ class Study:
             self.store.sync(pid)
         if job:
             self.executor.submit(self.generate_images, pid, job)
-        return self.view(mode, token)
+        result = self.view(mode, token)
+        if body.get('op') in {'archive_exit', 'restart_confirm'}:
+            with self.store.lock:
+                if body['op'] == 'restart_confirm':
+                    link = self.store.db.execute('SELECT invitation FROM restart_links WHERE participant=?', (pid,)).fetchone()
+                    invitation = (self.store.db.execute('SELECT * FROM invitations WHERE id=?', (link['invitation'],)).fetchone()
+                                  if link else None)
+                else:
+                    invitation = self.store.db.execute('SELECT * FROM invitations WHERE participant=?', (pid,)).fetchone()
+                if invitation:
+                    result['continuation_invitation' if body['op'] == 'archive_exit' else 'restart_invitation'] = self.access.describe(self.store.db, invitation)
+        return result
 
     def handle(self, db, row, state, revision, body, now):
         pid = row['id']
@@ -351,6 +416,10 @@ class Study:
             raise StudyError('操作类型无效。')
         if phase in TERMINAL:
             raise StudyError('本次实验已经结束。', 409)
+        if op in {'pause', 'continue', 'archive_exit', 'restart_prepare', 'restart_cancel', 'restart_confirm'}:
+            return self.participation.handle(db, row, state, revision, body, now)
+        if state.get('pause'):
+            raise StudyError('实验已暂停，请先继续实验。', 409, 'paused')
         if op == 'withdraw':
             state['withdrawal'] = {'at': timestamp(now), 'phase': phase,
                                    'reason': read_text(body, 'reason', 500), 'work': state['work']}
@@ -359,8 +428,15 @@ class Study:
             return None
         if op == 'start' and phase in TIMED and state['started'] is None:
             state['started'] = now
-            state['deadline'] = now + protocol['durations_seconds'][phase]
-            if phase == 'main_edit':
+            state['phase_pause_seconds'] = 0
+            seconds = state.pop('recovery_seconds', protocol['durations_seconds'][phase])
+            state['recovery_timer_seconds'] = seconds
+            state['deadline'] = now + seconds
+            restored = state.pop('recovery_work', None)
+            if restored is not None:
+                state['work'] = restored
+                state['work_version'] = self.store.version(db, pid, now, phase, 'admin_resumed_draft', restored)
+            elif phase == 'main_edit':
                 state['work'] = copy.deepcopy(main['ai'])
                 state['work_version'] = self.store.version(db, pid, now, phase, 'ai_working_draft', state['work'])
                 main['ai_version'] = state['work_version']
@@ -488,7 +564,8 @@ class Study:
                 db, pid, now, phase, 'frozen_timeout' if expired else 'frozen_submission', content,
                 parent=state.get('work_version'))
         self.store.event(db, pid, now, phase, 'phase_timed_out' if expired else 'phase_submitted',
-                         frozen_at=timestamp(frozen_at), complete=valid)
+                         frozen_at=timestamp(frozen_at), complete=valid,
+                         effective_seconds=max(0, frozen_at - state['started'] - state.get('phase_pause_seconds', 0)))
         if phase == 'main_draft':
             main.update(original=content, original_complete=valid, original_at=timestamp(frozen_at), original_version=version, original_method=method)
             if not valid:

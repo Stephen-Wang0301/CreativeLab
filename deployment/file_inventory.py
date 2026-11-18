@@ -18,8 +18,14 @@ FIRST_PARTY = {
     '.github/README.md': ('GitHub 展示的公开项目说明，不含实际邀请或登录信息', 'document'),
     '.githooks/pre-commit': ('Git 提交前检查暂存文件和私密信息', 'source'),
     '.githooks/pre-push': ('Git 推送前检查暂存文件和已保存历史', 'source'),
-    'Project_Tools.bat': ('打开 Windows 版本与服务器同步操作菜单', 'windows'),
-    'deployment/Project_Tools.ps1': ('查看改动、测试部署、阶段保存、推送和下载备份的菜单', 'source'),
+    'study/catalog.py': ('阶段.内容.功能三段展示版本、稳定内容批次及参与者编号规范', 'source'),
+    'study/participation.py': ('服务器计时暂停、续作、存档退出、10 秒确认和保留旧记录的重开', 'source'),
+    'tests/verify_participation.py': ('验证暂停持久化、有效用时、重开发号并发和三段版本兼容', 'source'),
+    'study/access.py': ('个人邀请签名、编号预留和一次参与的绑定与续作授权', 'source'),
+    'study/recovery.py': ('根据保存记录恢复中断阶段，保留完整状态快照及人工干预日志', 'source'),
+    'study/errors.py': ('HTTP 业务错误类型和状态码', 'source'),
+    'tests/verify_access.py': ('验证多次参与、邀请会话隔离、安全校验、人工恢复及备份', 'source'),
+    'tests/verify_catalog.py': ('验证跨版本归档、筛选、编号、旧数据迁移与完整备份', 'source'),
     'deployment/manage.py': ('独立执行代码部署、手动阶段提交、GitHub 发布、备份和回退', 'source'),
     'deployment/version_policy.py': ('公开源代码路径白名单、已知凭据及邀请口令检查', 'source'),
     'deployment/server_release.py': ('服务器代码预检、漂移检查、备份、替换、健康检查和回退', 'source'),
@@ -96,6 +102,9 @@ DATA_FILES = {
     'events.jsonl': '逐行保存的参与者操作事件镜像',
     'versions.jsonl': '逐行保存的稿件版本和恢复来源镜像',
     'ratings.json': '参与者作品的评审评分镜像',
+    'identity.json': '参与者固定身份、阶段、版本、批次和原技术编号的映射',
+    'batch.json': '该批次固定的阶段、采集版本、创建时间和目录标识',
+    'protocol.json': '该发布版本的冻结方案快照，不覆盖其他版本',
 }
 DEPENDENCIES = {
     'flask': 'Web 应用与路由', 'waitress': 'WSGI HTTP 服务', 'werkzeug': 'HTTP 请求、响应及路由工具',
@@ -170,6 +179,14 @@ def describe(relative, directory=False):
         return purpose, 'history'
     if parts[0] == 'data':
         if directory:
+            if name == 'batches':
+                return '按阶段和已发布采集版本独立归档的数据', 'data'
+            if name.startswith('v0.') or name.startswith('v1.'):
+                return '采集版本 ' + name[1:] + ' 的独立批次，包含冻结方案及参与者文件', 'data'
+            if name.startswith('S0-') or name.startswith('S1-') or name.startswith('Q-S'):
+                return '该阶段、版本和序号对应的参与者记录', 'data'
+            if name == 'participants':
+                return '该版本的参与者独立归档目录', 'data'
             if name == 'quick-demo':
                 return '与普通预试独立的快速演练数据', 'data'
             if name == '_system':

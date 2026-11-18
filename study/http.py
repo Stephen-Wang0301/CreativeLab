@@ -3,14 +3,16 @@ import json
 import os
 import re
 import subprocess
+import time
 from urllib.parse import urlsplit
 
-from flask import Flask, Response, jsonify, redirect, request, send_file, send_from_directory
+from flask import Flask, Response, g, jsonify, redirect, request, send_file, send_from_directory
 from itsdangerous import BadSignature, TimestampSigner
 from werkzeug.exceptions import HTTPException
 
 from .engine import MODES, PID_FORMAT, TOKEN_FORMAT, StudyError
 from .research import Research, TASKS
+from .access import PERSONAL_TOKEN
 
 WEB = os.path.join(os.path.dirname(__file__), 'web')
 IMAGE_FILE = re.compile(r'^r[12]-[12]-[a-f0-9]{24}\.(png|jpg|webp)$')
@@ -49,6 +51,12 @@ def create_apps(study, network):
         admin.config['TRUSTED_HOSTS'].append(admin_host)
     signer = TimestampSigner(study.store.secret, salt='creative-research-session')
 
+    def request_clock():
+        g.study_started = time.perf_counter()
+
+    public.before_request(request_clock)
+    admin.before_request(request_clock)
+
     def admin_signature():
         return hmac.new(study.store.secret.encode(),
                         ('research|' + study.store.admin_key).encode(), 'sha256').hexdigest()
@@ -70,6 +78,7 @@ def create_apps(study, network):
                 raise StudyError('请先登录研究后台。', 401)
 
     def make_app_headers(response):
+        response.headers['Server-Timing'] = f'app;dur={(time.perf_counter()-getattr(g,"study_started",time.perf_counter()))*1000:.2f}'
         response.headers.update({
             'Cache-Control': 'no-store',
             'X-Content-Type-Options': 'nosniff',
@@ -122,20 +131,67 @@ def create_apps(study, network):
 
     @public.get('/p/<mode>/api/landing')
     def landing(mode):
-        return jsonify(study.landing(mode))
+        return jsonify(study.landing(mode, request.headers.get('X-Study-Invitation')))
 
-    def participant_token(mode):
+    def personal_scope(mode, value=None):
+        value = value if value is not None else request.headers.get('X-Study-Invitation', '')
+        with study.store.lock:
+            return study.access.resolve(study.store.db, mode, value)
+
+    def participant_token(mode, invite=None):
+        personal = personal_scope(mode, invite)
+        access_id = request.args.get('access')
+        if not personal and access_id and re.fullmatch(r'[0-9a-f]{24}', access_id):
+            with study.store.lock:
+                personal = study.store.db.execute('SELECT * FROM invitations WHERE id=? AND mode=? AND disabled=0',
+                    (access_id, mode)).fetchone()
+        if personal:
+            if not personal['participant']:
+                return ''
+            token = (request.cookies.get('creative_' + mode + '_i_' + personal['id'])
+                     or request.cookies.get('creative_' + mode, ''))
+            if token:
+                with study.store.lock:
+                    row = study.authenticate(study.store.db, mode, token)
+                    if row['id'] != personal['participant']:
+                        return ''
+            return token
         return request.cookies.get('creative_' + mode, '')
 
-    def session_cookie(response, mode, token):
-        response.set_cookie('creative_' + mode, token, httponly=True,
+    def session_cookie(response, mode, token, invite=None):
+        personal = personal_scope(mode, invite)
+        name = 'creative_' + mode + ('_i_' + personal['id'] if personal else '')
+        response.set_cookie(name, token, httponly=True,
                             secure=request.is_secure, samesite='Lax', max_age=60*60*24*30, path=f'/p/{mode}/')
         return response
+
+    @public.post('/p/<mode>/api/entry')
+    def entry(mode):
+        body = same_origin_json()
+        invite = body.get('invite', '')
+        header_invite = request.headers.get('X-Study-Invitation', '')
+        if header_invite and header_invite != invite:
+            raise StudyError('邀请上下文不一致，请重新打开完整邀请链接。', 403)
+        try:
+            token = participant_token(mode, invite)
+            if token:
+                return jsonify(view=study.view(mode, token))
+        except StudyError as error:
+            if error.status != 401:
+                raise
+        personal = personal_scope(mode, invite)
+        token = study.access.claim(mode, invite) if personal else None
+        if token:
+            return session_cookie(jsonify(view=study.view(mode, token)), mode, token, invite)
+        return jsonify(landing=study.landing(mode, invite))
 
     @public.post('/p/<mode>/api/join')
     def join(mode):
         body = same_origin_json()
-        existing_token = participant_token(mode)
+        context = request.headers.get('X-Study-Invitation')
+        if context and context != body.get('invite'):
+            raise StudyError('邀请上下文不一致，请重新打开完整邀请链接。', 403)
+        existing_token = participant_token(mode, body.get('invite'))
         if existing_token:
             try:
                 existing = study.view(mode, existing_token)
@@ -145,12 +201,13 @@ def create_apps(study, network):
             else:
                 return jsonify(view=existing)
         pid, code, token = study.join(mode, body)
-        response = jsonify(view=study.view(mode, token), resume={'id': pid, 'code': code})
-        return session_cookie(response, mode, token)
+        view = study.view(mode, token)
+        response = jsonify(view=view, resume={'id': pid, 'code': code, 'participant_code': view['participant_code']})
+        return session_cookie(response, mode, token, body.get('invite'))
 
     @public.post('/p/<mode>/api/resume')
     def resume(mode):
-        token = study.resume(mode, same_origin_json())
+        token = study.resume(mode, same_origin_json(), request.headers.get('X-Study-Invitation'))
         return session_cookie(jsonify(view=study.view(mode, token)), mode, token)
 
     @public.get('/p/<mode>/api/state')
@@ -210,10 +267,65 @@ def create_apps(study, network):
 
     @admin.get('/research/api/health')
     def health():
+        return jsonify(health_payload())
+
+    def health_payload():
         visible = dict(network)
         visible.pop('_probe_id', None)
-        return jsonify(network=visible, data_path=str(study.store.root),
-                       tasks={key: {'label': value[0], 'instructions': value[1]} for key, value in TASKS.items()})
+        return dict(network=visible, data_path=str(study.store.root),
+                    tasks={key: {'label': value[0], 'instructions': value[1]} for key, value in TASKS.items()})
+
+    @admin.get('/research/api/<mode>/dashboard')
+    def dashboard(mode):
+        page = request.args.get('page', 'overview')
+        if page not in ('overview', 'people', 'protocol', 'analysis'):
+            raise StudyError('后台页面无效。')
+        with study.store.lock:
+            revision, _ = research.select(mode, request.args.get('revision'))
+            settings = study.settings(mode)
+            if page != 'protocol':
+                settings.pop('saved_draft', None)
+                settings.pop('draft', None)
+                if settings['active']:
+                    settings['active'].pop('protocol', None)
+            payload = {'health': health_payload(), 'settings': settings, 'revision': revision}
+            if page in ('overview', 'people'):
+                payload['overview'] = research.overview(mode, revision)
+            if page == 'analysis':
+                payload['analysis'] = research.analysis(mode, revision)
+            if page == 'overview':
+                payload['invitations'] = study.access.list(mode, settings['active']['id']) if settings['active'] else []
+            return jsonify(payload)
+
+    @admin.post('/research/api/<mode>/invitations')
+    def create_invitation(mode):
+        body = same_origin_json()
+        return jsonify(study.access.create(mode, body.get('revision')))
+
+    @admin.get('/research/api/<mode>/invitations')
+    def list_invitations(mode):
+        with study.store.lock:
+            revision, _ = research.select(mode, request.args.get('revision'))
+            try:
+                offset = int(request.args.get('offset', 0))
+                if not 0 <= offset <= 1_000_000:
+                    raise ValueError()
+            except ValueError as error:
+                raise StudyError('邀请列表页码无效。') from error
+            return jsonify(invitations=study.access.list(mode, revision, offset))
+
+    @admin.post('/research/api/<mode>/person/<pid>/recover')
+    def recover_person(mode, pid):
+        body = same_origin_json()
+        result = study.recovery.restore(mode, pid, body.get('expected_serial'), body.get('reason'))
+        result['person'] = research.detail(mode, pid)
+        result['overview'] = research.overview(mode, result['person']['progress']['revision'])
+        return jsonify(result)
+
+    @admin.post('/research/api/<mode>/person/<pid>/continue-link')
+    def continuation_link(mode, pid):
+        same_origin_json()
+        return jsonify(study.access.create(mode, participant=pid))
 
     @admin.get('/research/api/<mode>/settings')
     def settings(mode):
@@ -233,9 +345,12 @@ def create_apps(study, network):
 
     @admin.get('/research/api/<mode>/analysis.csv')
     def analysis_csv(mode):
-        data = research.analysis_csv(mode, request.args.get('revision'))
+        with study.store.lock:
+            revision, _ = research.select(mode, request.args.get('revision'))
+            data = research.analysis_csv(mode, revision)
+            batch_id = study.store.revision(study.store.db, revision)['batch_id']
         return Response(data, mimetype='text/csv',
-                        headers={'Content-Disposition': f'attachment; filename="{mode}-analysis.csv"'})
+                        headers={'Content-Disposition': f'attachment; filename="{batch_id}-analysis.csv"'})
 
     @admin.get('/research/api/<mode>/person/<pid>')
     def person(mode, pid):
@@ -288,12 +403,21 @@ def create_apps(study, network):
     def raw_zip(mode):
         pid = request.args.get('id')
         stream = research.raw_zip(mode, request.args.get('revision'), pid)
-        return zip_response(stream, (pid if pid else mode + '-raw') + '.zip')
+        with study.store.lock:
+            if pid:
+                filename = research.participant(mode, pid)['participant_code']
+            else:
+                revision, _ = research.select(mode, request.args.get('revision'))
+                filename = study.store.revision(study.store.db, revision)['batch_id'] + '-raw'
+        return zip_response(stream, filename + '.zip')
 
     @admin.get('/research/api/<mode>/packet/<task>')
     def packet(mode, task):
-        stream = research.packet(mode, request.args.get('revision'), task)
-        return zip_response(stream, task + '-blind-packet.zip')
+        with study.store.lock:
+            revision, _ = research.select(mode, request.args.get('revision'))
+            stream = research.packet(mode, revision, task)
+            batch_id = study.store.revision(study.store.db, revision)['batch_id']
+        return zip_response(stream, batch_id + '-' + task + '-blind-packet.zip')
 
     @admin.post('/research/api/<mode>/ratings')
     def ratings(mode):

@@ -30,6 +30,11 @@ study/
   tunnel.py              Cloudflare 隧道与 HTTPS 自检
   deploy.py              Windows 便携安装与原数据保护
   config.py              方案校验与材料配置
+  catalog.py             阶段、实验版本和参与者编号规则
+  access.py              一份个人邀请绑定一次参与，按邀请隔离会话
+  recovery.py            研究人员恢复中断阶段，保留快照和干预日志
+  participation.py       服务器暂停、存档退出及保留旧记录的自动重开
+  errors.py              API 业务异常类型
   materials/default.json 初始化材料
   web/                   受试者与研究后台前端
 deployment/
@@ -44,13 +49,20 @@ deployment/
   server_inventory.py    私有服务器文件与数据元数据扫描
 tests/                   临时数据测试，不读取真实受试者记录
 .githooks/               提交与推送前的私密信息检查
-Project_Tools.bat         Windows 操作菜单
 AGENTS.md                协作约定：阶段提交由项目所有者决定
 ```
 
 ## 版本与数据
 
 日常修改、测试网站部署、Git 阶段提交分别执行。只有明确决定保留的阶段才创建提交；没有自动提交或自动部署。详见 [版本与同步说明](../deployment/version-control.md)。
+
+维护工作通过协作对话中的 1–11 项指令执行，原 BAT 菜单已移除，底层命令行工具继续保留。
+
+展示版本采用 `阶段.内容.功能`，当前为 `0.1.1`。0 为预试、1 为正式；修改作答材料或流程后发布下一内容版本（如 `0.2.1`），功能补丁只改第三位。草稿不递增版本号，Git 提交独立管理。内容相同的功能补丁共用一批数据，保留 `data/batches/pilot/v0.1/` 这样的稳定目录和 `S0-V0001-P000001` 编号；补丁清单另存于批次 `releases/`，不会重写原方案或身份快照。
+
+个人邀请只展示对应参与编号，实际访问使用长签名链接。通用邀请可供多个新浏览器首次参与，同一浏览器回到原记录；重复测试使用新的个人邀请。已报名邀请从待使用列表隐藏，继续链接位于参与者详情，不触发人工恢复。
+
+受试者可点击暂停或按 ESC，服务器保存稿件并冻结剩余时间，界面模糊遮挡。继续实验、存档并退出保持原编号；预试从头开始须完整等待十秒，封存旧记录并自动领取新编号。正式阶段暂不开放自行重开。暂停、有效用时、人工恢复和重开关联可在数据中追溯。
 
 `data/`、`private/`、`.runtime/`、`backups/`、`logs/`、根目录私有 `README.md`、机器配置、生成清单和二进制运行环境均不进入 Git。GitHub 保存可公开源代码；实验数据使用私有整站备份保存和迁移。
 
@@ -60,6 +72,9 @@ AGENTS.md                协作约定：阶段提交由项目所有者决定
 python tests/verify_flow.py
 python tests/verify_deploy.py
 python tests/verify_version_control.py
+python tests/verify_catalog.py
+python tests/verify_access.py
+python tests/verify_participation.py
 python deployment/manage.py check
 ```
 
